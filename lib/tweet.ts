@@ -227,18 +227,95 @@ export function normalizeFxtwitter(payload: AnyRec): Post | null {
  * fetching
  * ------------------------------------------------------------------ */
 
-async function getJson(url: string): Promise<AnyRec | null> {
-  try {
-    const res = await fetch(url, {
-      headers: { "user-agent": UA, accept: "application/json" },
-      cache: "no-store",
-      signal: AbortSignal.timeout(12_000),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as AnyRec;
-  } catch {
-    return null;
+interface FetchOutcome {
+  status?: number;
+  error?: string;
+  data: AnyRec | null;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Fetches JSON, retrying once on throttling or a transient socket error. */
+async function getJson(url: string): Promise<FetchOutcome> {
+  let last: FetchOutcome = { data: null };
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { "user-agent": UA, accept: "application/json", referer: "https://x.com/" },
+        cache: "no-store",
+        signal: AbortSignal.timeout(12_000),
+      });
+
+      if (res.ok) return { status: res.status, data: (await res.json()) as AnyRec };
+
+      last = { status: res.status, data: null };
+      const retryable = res.status === 429 || res.status >= 500;
+      if (!retryable || attempt === 1) return last;
+    } catch (error) {
+      const code = (error as { cause?: { code?: string } })?.cause?.code;
+      last = { error: code ?? (error as Error).message, data: null };
+      if (attempt === 1) return last;
+    }
+
+    await sleep(600);
   }
+
+  return last;
+}
+
+export interface Attempt {
+  source: Source;
+  /** HTTP status from the upstream source, when a response was received. */
+  status?: number;
+  /** Socket-level failure, e.g. ECONNRESET / ENOTFOUND / timeout. */
+  error?: string;
+  /** True when the payload parsed into at least one downloadable video. */
+  found: boolean;
+  videos: number;
+  /** Set when the source answered but the post carried no video. */
+  note?: string;
+}
+
+export interface Inspection {
+  post: Post | null;
+  attempts: Attempt[];
+}
+
+/**
+ * Queries every source and reports exactly what each one did. This is what makes a
+ * failure legible: "throttled" (429), "refused" (403), "unreachable" (ECONNRESET)
+ * and "this post has no video" are completely different problems.
+ */
+export async function inspectPost(id: string): Promise<Inspection> {
+  const attempts: Attempt[] = [];
+
+  const syndicated = await getJson(
+    `https://cdn.syndication.twimg.com/tweet-result?id=${id}&lang=en&token=${syndicationToken(id)}`,
+  );
+  const fromSyndication = syndicated.data ? normalizeSyndication(syndicated.data) : null;
+  attempts.push({
+    source: "syndication",
+    status: syndicated.status,
+    error: syndicated.error,
+    found: Boolean(fromSyndication),
+    videos: fromSyndication?.videos.length ?? 0,
+    note: syndicated.data && !fromSyndication ? "answered, but the post has no video" : undefined,
+  });
+  if (fromSyndication) return { post: fromSyndication, attempts };
+
+  const mirrored = await getJson(`https://api.fxtwitter.com/status/${id}`);
+  const fromMirror = mirrored.data ? normalizeFxtwitter(mirrored.data) : null;
+  attempts.push({
+    source: "fxtwitter",
+    status: mirrored.status,
+    error: mirrored.error,
+    found: Boolean(fromMirror),
+    videos: fromMirror?.videos.length ?? 0,
+    note: mirrored.data && !fromMirror ? "answered, but the post has no video" : undefined,
+  });
+
+  return { post: fromMirror, attempts };
 }
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -248,20 +325,36 @@ export async function resolvePost(id: string): Promise<Post | null> {
   const hit = cache.get(id);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.post;
 
-  const token = syndicationToken(id);
-  const syndicated = await getJson(
-    `https://cdn.syndication.twimg.com/tweet-result?id=${id}&lang=en&token=${token}`,
-  );
-  let post = syndicated ? normalizeSyndication(syndicated) : null;
-
-  if (!post) {
-    const fx = await getJson(`https://api.fxtwitter.com/status/${id}`);
-    post = fx ? normalizeFxtwitter(fx) : null;
-  }
+  const { post } = await inspectPost(id);
 
   if (cache.size > 100) cache.clear();
   cache.set(id, { at: Date.now(), post });
   return post;
+}
+
+/** Human-readable reason for a failed lookup, built from the per-source attempts. */
+export function explainFailure(attempts: Attempt[]): string {
+  const noVideo = attempts.find((a) => a.note);
+  if (noVideo) return "That post doesn't contain a video (it may only have text or images).";
+
+  const throttled = attempts.find((a) => a.status === 429);
+  if (throttled) {
+    return "X is rate limiting this deployment right now (HTTP 429 from its public endpoint). Wait a minute or two and try again.";
+  }
+
+  const notFound = attempts.every((a) => a.status === 404);
+  if (notFound) return "Post not found — check the link, it may be deleted or private.";
+
+  const unreachable = attempts.every((a) => a.error);
+  if (unreachable) {
+    const codes = attempts.map((a) => a.error).join(", ");
+    return `This server could not reach X at all (${codes}). That means the deployment's network is blocked from the post endpoints, not that the link is wrong.`;
+  }
+
+  const statuses = attempts
+    .map((a) => `${a.source}: ${a.status ?? a.error ?? "no response"}`)
+    .join(", ");
+  return `Could not read that post (${statuses}).`;
 }
 
 /**

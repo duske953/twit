@@ -1,17 +1,19 @@
 import { NextResponse } from "next/server";
-import { extractPostId, probeMedia, resolvePost } from "../../../lib/tweet";
+import { explainFailure, extractPostId, inspectPost, probeMedia } from "../../../lib/tweet";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
 /**
- * Diagnostics for a failed download. Open /api/check?url=<post link> in a browser:
+ * Diagnostics for a failed download. Open /api/check?url=<post link> in a browser.
  *
- *  - metadata ok + probe ok        -> the server can fetch the video; the problem is elsewhere
- *  - metadata ok + probe ECONNRESET/ENOTFOUND -> this server's network blocks video.twimg.com
- *    (running locally on a blocked connection? deploy it, the deployed host is the one that
- *    does the fetching)
- *  - metadata ok + probe 403/404   -> X's CDN is refusing this server (datacenter IP / bad tag)
+ * `attempts` shows what each metadata source answered, which separates the cases that
+ * otherwise look identical:
+ *   status 429            -> X is throttling this deployment's IP
+ *   status 403 / 404      -> post missing/private, or the source refuses this server
+ *   error ECONNRESET      -> this deployment's network cannot reach X
+ *   note "no video"       -> the post simply has no video
+ * `media` then HEAD-probes the chosen MP4, i.e. whether the download itself could work.
  */
 export async function GET(request: Request) {
   const input = new URL(request.url).searchParams.get("url") ?? "";
@@ -24,19 +26,16 @@ export async function GET(request: Request) {
     );
   }
 
-  const post = await resolvePost(id);
+  const { post, attempts } = await inspectPost(id);
+
   if (!post) {
     return NextResponse.json(
-      {
-        ok: false,
-        step: "metadata",
-        error: "Could not read metadata from syndication or fxtwitter.",
-      },
+      { ok: false, step: "metadata", id, error: explainFailure(attempts), attempts },
       { status: 404 },
     );
   }
 
-  const probes = await Promise.all(
+  const media = await Promise.all(
     post.videos.map(async (video, index) => {
       const variant = video.variants[0];
       return {
@@ -53,6 +52,7 @@ export async function GET(request: Request) {
     id: post.id,
     author: post.author,
     metadataSource: post.source,
-    videos: probes,
+    attempts,
+    media,
   });
 }

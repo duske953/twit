@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { extractPostId, resolvePost } from "../../../lib/tweet";
+import { explainFailure, extractPostId, inspectPost } from "../../../lib/tweet";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -19,15 +19,11 @@ export async function GET(request: Request) {
     );
   }
 
-  const post = await resolvePost(id);
+  const { post, attempts } = await inspectPost(id);
 
   if (!post) {
     return NextResponse.json(
-      {
-        ok: false,
-        error:
-          "No downloadable video found for that post. It may have no video, be private/deleted, or the public endpoints may be rate limiting right now.",
-      },
+      { ok: false, error: explainFailure(attempts), attempts },
       { status: 404 },
     );
   }

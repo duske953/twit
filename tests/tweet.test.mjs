@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  explainFailure,
   extractPostId,
   normalizeFxtwitter,
   normalizeSyndication,
@@ -187,6 +188,32 @@ test("normalizes the fxtwitter fallback", () => {
     post.videos[0].variants.map((v) => v.label),
     ["1080p", "360p"],
   );
+});
+
+test("explains each failure mode distinctly", () => {
+  const noVideo = [
+    { source: "syndication", status: 200, found: false, videos: 0, note: "answered, but the post has no video" },
+  ];
+  assert.match(explainFailure(noVideo), /doesn't contain a video/);
+
+  const throttled = [
+    { source: "syndication", status: 429, found: false, videos: 0 },
+    { source: "fxtwitter", status: 429, found: false, videos: 0 },
+  ];
+  assert.match(explainFailure(throttled), /rate limiting/);
+
+  const missing = [
+    { source: "syndication", status: 404, found: false, videos: 0 },
+    { source: "fxtwitter", status: 404, found: false, videos: 0 },
+  ];
+  assert.match(explainFailure(missing), /not found/);
+
+  const unreachable = [
+    { source: "syndication", error: "ECONNRESET", found: false, videos: 0 },
+    { source: "fxtwitter", error: "ENOTFOUND", found: false, videos: 0 },
+  ];
+  assert.match(explainFailure(unreachable), /could not reach X/);
+  assert.match(explainFailure(unreachable), /ECONNRESET/);
 });
 
 test("returns null when a post carries no video", () => {
