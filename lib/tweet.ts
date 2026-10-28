@@ -264,6 +264,34 @@ export async function resolvePost(id: string): Promise<Post | null> {
   return post;
 }
 
+/**
+ * Diagnostic: does THIS server reach the media host, and what does it answer?
+ * Used by /api/check to tell a network block apart from a CDN rejection.
+ */
+export async function probeMedia(url: string): Promise<{
+  status?: number;
+  contentType?: string | null;
+  contentLength?: string | null;
+  error?: string;
+}> {
+  try {
+    const res = await fetch(url, {
+      method: "HEAD",
+      headers: { "user-agent": UA, referer: "https://x.com/" },
+      cache: "no-store",
+      signal: AbortSignal.timeout(10_000),
+    });
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      contentLength: res.headers.get("content-length"),
+    };
+  } catch (error) {
+    const code = (error as { cause?: { code?: string } })?.cause?.code;
+    return { error: code ?? (error as Error).name };
+  }
+}
+
 export function fileNameFor(post: Post, variant: Variant, index: number): string {
   const author = post.author.replace(/[^\w.-]+/g, "_") || "post";
   const suffix = post.videos.length > 1 ? `-${index + 1}` : "";
