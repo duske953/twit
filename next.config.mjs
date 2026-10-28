@@ -2,12 +2,9 @@
 const nextConfig = {
   async rewrites() {
     return [
-      // Video bytes are proxied at the edge by Vercel's rewrite layer, NOT by a
-      // Function. Functions cap responses at 4.5 MB, which would break any real
-      // video; a rewrite has no such limit and streams with Range support.
+      // Used for the in-page preview player only. Downloads go through /api/media,
+      // which relays the video in chunks under Vercel's 4.5 MB response payload cap.
       { source: "/m/:path*", destination: "https://video.twimg.com/:path*" },
-      // Poster/thumbnail images, same idea.
-      { source: "/p/:path*", destination: "https://pbs.twimg.com/:path*" },
     ];
   },
 };

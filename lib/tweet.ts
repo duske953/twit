@@ -385,6 +385,18 @@ export async function probeMedia(url: string): Promise<{
   }
 }
 
+export function pickVariant(
+  post: Post,
+  videoIndex: number,
+  qualityIndex: number,
+): { video: Video; variant: Variant } | null {
+  const video = post.videos[videoIndex];
+  if (!video) return null;
+  const variant = video.variants[qualityIndex] ?? video.variants[0];
+  if (!variant) return null;
+  return { video, variant };
+}
+
 export function fileNameFor(post: Post, variant: Variant, index: number): string {
   const author = post.author.replace(/[^\w.-]+/g, "_") || "post";
   const suffix = post.videos.length > 1 ? `-${index + 1}` : "";

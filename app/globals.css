@@ -199,8 +199,28 @@ select {
   text-decoration: none;
 }
 
-.download:hover {
+.download:hover:not(:disabled) {
   filter: brightness(1.1);
+}
+
+.download:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+
+.bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.bar > span {
+  display: block;
+  height: 100%;
+  min-width: 4px;
+  background: var(--accent);
+  transition: width 0.2s ease;
 }
 
 .meta {

@@ -25,11 +25,15 @@ interface Post {
   videos: Video[];
 }
 
-/** Point a twimg URL at our own origin, where the rewrite proxy serves it. */
-function viaOwnHost(url: string, prefix: "/m" | "/p"): string {
+/** Must match MAX_CHUNK in /api/media — keeps each response under Vercel's payload cap. */
+const CHUNK = 4_000_000;
+const MAX_CHUNKS = 500;
+
+/** Preview only: twimg path served by the /m/ rewrite. */
+function viaOwnHost(url: string): string {
   try {
     const parsed = new URL(url);
-    return `${prefix}${parsed.pathname}${parsed.search}`;
+    return `/m${parsed.pathname}${parsed.search}`;
   } catch {
     return url;
   }
@@ -47,12 +51,19 @@ function duration(ms?: number): string | null {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
+function mb(bytes: number): string {
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
 export default function Page() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [post, setPost] = useState<Post | null>(null);
   const [picked, setPicked] = useState<Record<number, number>>({});
+  const [progress, setProgress] = useState<{ key: string; got: number; total?: number } | null>(
+    null,
+  );
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -78,6 +89,73 @@ export default function Page() {
     }
   }
 
+  /**
+   * Pulls the video in bounded chunks and assembles it in the browser. A single response
+   * cannot exceed Vercel's 4.5 MB payload cap, so large videos are fetched piece by piece.
+   */
+  async function download(
+    post: Post,
+    videoIndex: number,
+    qualityIndex: number,
+    variant: Variant,
+  ) {
+    const key = `${post.id}-${videoIndex}`;
+    if (progress) return;
+
+    setError(null);
+    setProgress({ key, got: 0 });
+
+    const parts: BlobPart[] = [];
+    let start = 0;
+    let total: number | undefined;
+
+    try {
+      for (let attempt = 0; attempt < MAX_CHUNKS; attempt++) {
+        const res = await fetch(
+          `/api/media?id=${post.id}&v=${videoIndex}&q=${qualityIndex}&start=${start}&len=${CHUNK}`,
+        );
+
+        if (!res.ok) {
+          const detail = await res.json().catch(() => null);
+          throw new Error(detail?.error ?? `The server returned HTTP ${res.status}.`);
+        }
+
+        const sizeHeader = Number(res.headers.get("x-total-size") ?? 0);
+        if (sizeHeader > 0) total = sizeHeader;
+
+        const buffer = await res.arrayBuffer();
+        if (buffer.byteLength === 0) break;
+
+        parts.push(buffer);
+        start += buffer.byteLength;
+        setProgress({ key, got: start, total });
+
+        if (total && start >= total) break;
+        if (buffer.byteLength < CHUNK) break;
+      }
+
+      if (parts.length === 0) throw new Error("The server returned no data.");
+
+      const blob = new Blob(parts, { type: "video/mp4" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = fileName(post, videoIndex, variant);
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? `${cause.message} If this keeps happening, try a lower quality.`
+          : "Download failed.",
+      );
+    } finally {
+      setProgress(null);
+    }
+  }
+
   return (
     <main className="wrap">
       <h1>Post video downloader</h1>
@@ -100,7 +178,7 @@ export default function Page() {
           {loading ? "Checking…" : "Get video"}
         </button>
       </form>
-      <p className="hint">Short links, share links with ?s=20, or a bare post ID all work.</p>
+      <p className="hint">Share links with ?s=20 or a bare post ID work too.</p>
 
       {error && <div className="error">{error}</div>}
 
@@ -108,9 +186,15 @@ export default function Page() {
         const choice = picked[videoIndex] ?? 0;
         const variant = video.variants[choice] ?? video.variants[0];
         const length = duration(video.durationMs);
+        const key = `${post.id}-${videoIndex}`;
+        const busy = progress?.key === key;
+        const pct =
+          busy && progress?.total
+            ? Math.min(100, Math.round((progress.got / progress.total) * 100))
+            : null;
 
         return (
-          <article className="card" key={`${post.id}-${videoIndex}`}>
+          <article className="card" key={key}>
             <header className="card-head">
               <span className="author">{post.authorName || post.author}</span>
               <span className="handle">@{post.author}</span>
@@ -121,18 +205,18 @@ export default function Page() {
 
             <div className="media">
               <video
-                key={variant.url}
                 controls
                 playsInline
                 preload="metadata"
-                poster={video.poster ? viaOwnHost(video.poster, "/p") : undefined}
-                src={viaOwnHost(variant.url, "/m")}
+                poster={`/api/poster?id=${post.id}&v=${videoIndex}`}
+                src={viaOwnHost(variant.url)}
               />
 
               <div className="row">
                 {video.variants.length > 1 && (
                   <select
                     value={choice}
+                    disabled={busy}
                     aria-label="Quality"
                     onChange={(e) =>
                       setPicked((prev) => ({ ...prev, [videoIndex]: Number(e.target.value) }))
@@ -146,18 +230,29 @@ export default function Page() {
                   </select>
                 )}
 
-                <a
+                <button
+                  type="button"
                   className="download"
-                  href={viaOwnHost(variant.url, "/m")}
-                  download={fileName(post, videoIndex, variant)}
+                  disabled={busy}
+                  onClick={() => download(post, videoIndex, choice, variant)}
                 >
-                  Download {variant.label} MP4
-                </a>
+                  {busy
+                    ? progress?.total
+                      ? `Downloading ${mb(progress.got)} / ${mb(progress.total)}`
+                      : `Downloading ${mb(progress.got)}…`
+                    : `Download ${variant.label} MP4`}
+                </button>
               </div>
+
+              {busy && (
+                <div className="bar" aria-hidden>
+                  <span style={{ width: pct === null ? "100%" : `${pct}%` }} />
+                </div>
+              )}
 
               <div className="row">
                 {length && <span className="meta">{length}</span>}
-                <span className="meta">via this server</span>
+                <span className="meta">assembled in your browser</span>
                 <a
                   className="orig"
                   href={`https://x.com/i/status/${post.id}`}
@@ -173,8 +268,8 @@ export default function Page() {
       })}
 
       <p className="foot">
-        Public posts only. Media is streamed live from X through <code>/m/…</code> on this
-        deployment — nothing is stored. Keep to content you have the right to download.
+        Public posts only. Bytes stream from X through this deployment — nothing is stored.
+        Keep to content you have the right to download.
       </p>
     </main>
   );
